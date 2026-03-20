@@ -80,8 +80,10 @@ Input:
 - File path to a completed SDRTrunk recording
 
 Output:
-- Returns success or failure to `DirectoryWatcher`
-- On success: calls `PacketAssembler.finalize_from_file(signal)` and emits `PACKET_SAVED`
+- Returns `IngestResult` to `DirectoryWatcher` with one of three statuses:
+  - `success` — packet assembled and stored; `packet_id` populated
+  - `failed` — transient or extraction error; `error_type` populated; eligible for retry
+  - `skipped` — unsupported format; no retry
 
 Failure handling:
 - Unsupported format (e.g. WAV in V1): logged, recording marked `skipped` — no retry
@@ -247,6 +249,16 @@ FileState {
 
 `skipped` is terminal — no retry. Used for unsupported formats in the current version.
 
+### 4.3 IngestResult
+
+```
+IngestResult {
+  status:     "success" | "failed" | "skipped"
+  error_type: str | None    # populated on failed; None otherwise
+  packet_id:  UUID | None   # populated on success; None otherwise
+}
+```
+
 ---
 
 ## 5. Lifecycle Sequence
@@ -299,7 +311,7 @@ SDRTrunk writes recording
 ingest(path: Path) -> IngestResult
 ```
 
-`IngestResult` carries: success/failure status, error type if failed, and `packet_id` if the packet was saved. In V1 a plain `bool` is acceptable; `IngestResult` is the intended V2 shape.
+`IngestResult` carries the outcome of a single ingest attempt. See section 4.3.
 
 ### 6.2 FileIngester → MetadataExtractor
 
