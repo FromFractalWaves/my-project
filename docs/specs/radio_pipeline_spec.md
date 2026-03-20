@@ -60,7 +60,7 @@ Each stage is replaceable. The TRM only cares about the message contract. The ra
 
 This project maps to the pattern as follows:
 
-**OP25 → TransmissionPackets → Multi-ASR → TRM → Threads + Events → Summaries**
+**SDRTRunk → TransmissionPackets → Multi-ASR → TRM → Threads + Events → Summaries**
 
 Each stage adds structure and meaning while preserving access to the original source. No stage overwrites earlier data.
 
