@@ -59,6 +59,9 @@ Constraints:
 - Fixed duration (e.g. 10 seconds)
 - FIFO eviction
 
+Ownership note:
+- AudioBuffer is the single source of audio ingestion. CallTracker slices from it via `get_last()` but does not own raw audio ingestion. This prevents duplicate buffering and clarifies responsibility when scaling.
+
 Failure handling:
 - If the buffer is empty when `get_last()` is called, returns an empty segment — call starts with no pre-roll rather than failing
 
@@ -224,6 +227,10 @@ end_call(call: CallState) -> None
 
 Centralizes call termination logic. Called by both the timeout poller and any explicit end signal. Responsible for post-roll append, removal from `active_calls`, emitting `CALL_ENDED`, and handing off to `PacketAssembler`.
 
+---
+
+## 4. Data Structures
+
 ### 4.1 CallState
 
 ```
@@ -292,7 +299,7 @@ source_ids.add(source_id)
 
 ### 5.4 Call End Sequence
 
-Decision point — timeout poller calls `resolve_call` or iterates `active_calls` directly:
+Decision point — timeout poller iterates `active_calls` directly:
 ```python
 if now - call.last_activity_time > CALL_END_TIMEOUT:
 ```
