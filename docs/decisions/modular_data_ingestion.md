@@ -1,0 +1,1 @@
+data saved to the data base shoould be based on a parent class that defines "packets" so we can ingest any data for processing and passing to TRM
