@@ -109,8 +109,18 @@ Input:
 
 Output:
 
+`TransmissionPacket` extends the base `Packet` class defined in `decisions/modular_data_ingestion.md`. All packets stored to the database must conform to that base schema. `TransmissionPacket` adds radio-specific fields on top of it.
+
 ```
-TransmissionPacket {
+TransmissionPacket(Packet) {
+  # --- base Packet fields ---
+  packet_id,          # maps to transmission_id
+  packet_type,        # "transmission"
+  timestamp,          # maps to timestamp_start
+  source,             # maps to talkgroup_id + source_ids
+  metadata,
+
+  # --- TransmissionPacket-specific fields ---
   transmission_id,
   timestamp_start,
   timestamp_end,
@@ -118,8 +128,7 @@ TransmissionPacket {
   source_ids,
   frequency,
   encrypted,
-  audio_path,
-  metadata
+  audio_path
 }
 ```
 
@@ -278,7 +287,7 @@ Actions:
 ```
 /recordings/YYYY/MM/DD/{uuid}.wav
 ```
-2. Create `TransmissionPacket`
+2. Create `TransmissionPacket` (conforming to base `Packet`)
 3. Insert into database
 4. Emit `PACKET_SAVED`
 
@@ -386,4 +395,4 @@ POLL_INTERVAL_MS     = 100
 
 ## 10. Result
 
-A deterministic ingestion module that converts OP25 output into structured `TransmissionPacket` objects with audio, ready for downstream ASR processing and TRM routing.
+A deterministic ingestion module that converts OP25 output into structured `TransmissionPacket` objects (conforming to the base `Packet` schema) with audio, ready for downstream ASR processing and TRM routing.
