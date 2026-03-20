@@ -1,1 +1,5 @@
 .ctree
+.venv
+demo_output/
+prototypes/op25_integration_skeleton/src/op25_integration_skeleton.egg-info
+__pycache__
