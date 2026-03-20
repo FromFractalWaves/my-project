@@ -79,7 +79,9 @@ Output (via EventBus):
 
 On `CALL_ENDED`: invokes `PacketAssembler.finalize_call()` directly. This is an internal handoff, not a bus notification.
 
-V1 assumption: at most one active `CallState` exists per talkgroup at a time. Overlapping same-talkgroup traffic is out of scope for this revision.
+**`active_calls` structure:** `dict[talkgroup_id → list[CallState]]`
+
+V1 always has at most one item per list. Call resolution goes through `resolve_call(signal)` — in V1 this returns the first item or `None`. This isolates the selection logic so V2 can handle overlapping calls on the same talkgroup without restructuring the data or refactoring call sites.
 
 Failure handling:
 - If `PacketAssembler.finalize_call()` throws, the call is removed from `active_calls` and the error is logged — ingestion continues
@@ -204,6 +206,14 @@ save_audio(audio: AudioSegment, path: str) -> None
 insert_packet(packet: TransmissionPacket) -> None
 ```
 
+### 3.5 CallTracker — Internal
+
+```python
+resolve_call(signal: Op25Signal) -> CallState | None
+```
+
+Returns the active `CallState` for the signal's talkgroup, or `None` if no active call exists. In V1, always returns `active_calls[tgid][0]` or `None`. In future versions, this method encapsulates selection logic for overlapping calls.
+
 ---
 
 ## 4. Data Structures
@@ -221,6 +231,15 @@ CallState {
   encrypted:          bool
   audio_segments:     list
 }
+```
+
+### 4.2 active_calls
+
+```python
+active_calls: dict[int, list[CallState]]
+# key: talkgroup_id
+# value: list of active CallState objects for that talkgroup
+# V1: list always has 0 or 1 items
 ```
 
 ---
@@ -241,22 +260,20 @@ PacketAssembler → EventBus  (PACKET_SAVED)
 ### 5.2 Call Start Sequence
 
 1. JSONListener receives UDP packet, parses it into an `Op25Signal`, calls `CallTracker.handle_signal(signal)` directly
-2. CallTracker checks:
-```python
-if talkgroup_id not in active_calls:
-```
+2. CallTracker calls `resolve_call(signal)` — returns `None` (no active call)
 3. Create `CallState`
-4. Pull pre-roll:
+4. Append to `active_calls[tgid]`
+5. Pull pre-roll:
 ```python
 audio = AudioBuffer.get_last(2-3 seconds)
 ```
-5. Emit `CALL_STARTED`
+6. Emit `CALL_STARTED`
 
 ---
 
 ### 5.3 Call Active Sequence
 
-1. Incoming `Op25Signal` updates call
+1. CallTracker calls `resolve_call(signal)` — returns existing `CallState`
 2. Append audio chunks continuously
 3. Update:
 ```python
@@ -269,15 +286,16 @@ source_ids.add(source_id)
 
 ### 5.4 Call End Sequence
 
-Decision point:
+Decision point — timeout poller calls `resolve_call` or iterates `active_calls` directly:
 ```python
-if now - last_activity_time > timeout:
+if now - call.last_activity_time > CALL_END_TIMEOUT:
 ```
 
 Actions:
 1. Append post-roll audio
 2. Emit `CALL_ENDED`
-3. Pass `CallState` to `PacketAssembler`
+3. Remove `CallState` from `active_calls[tgid]`
+4. Pass `CallState` to `PacketAssembler`
 
 ---
 
@@ -311,9 +329,10 @@ Loop behavior:
 while True:
     now = current_time()
 
-    for call in active_calls.values():
-        if now - call.last_activity_time > CALL_END_TIMEOUT:
-            end_call(call)
+    for call_list in active_calls.values():
+        for call in call_list:
+            if now - call.last_activity_time > CALL_END_TIMEOUT:
+                end_call(call)
 
     sleep(POLL_INTERVAL_MS)
 ```
@@ -334,22 +353,24 @@ Rationale:
 ### 6.1 Call Start Detection
 
 ```python
-if talkgroup_id not in active_calls:
-    start_call()
+call = resolve_call(signal)
+if call is None:
+    start_call(signal)
 ```
 
 ### 6.2 Call Continuation
 
 ```python
-if talkgroup_id in active_calls:
-    update_call()
+call = resolve_call(signal)
+if call is not None:
+    update_call(call, signal)
 ```
 
 ### 6.3 Call End Detection
 
 ```python
-if now - last_activity_time > CALL_END_TIMEOUT:
-    end_call()
+if now - call.last_activity_time > CALL_END_TIMEOUT:
+    end_call(call)
 ```
 
 ### 6.4 Encrypted Handling
