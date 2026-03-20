@@ -46,6 +46,8 @@ Failure handling:
 Responsibility:
 - Maintain rolling buffer of recent audio samples
 
+AudioBuffer is the single source of audio. CallTracker references or slices from it but does not own raw audio ingestion.
+
 Input:
 - Continuous audio stream (PCM chunks)
 
@@ -212,11 +214,15 @@ insert_packet(packet: TransmissionPacket) -> None
 resolve_call(signal: Op25Signal) -> CallState | None
 ```
 
-Returns the active `CallState` for the signal's talkgroup, or `None` if no active call exists. In V1, always returns `active_calls[tgid][0]` or `None`. In future versions, this method encapsulates selection logic for overlapping calls.
+Returns the active `CallState` for the signal's talkgroup, or `None` if no active call exists. In V1, always returns `active_calls[tgid][0]` or `None`. In future versions, this method encapsulates selection logic for overlapping calls. Selection may consider `talkgroup_id`, `source_id`, `frequency`, and recency.
 
----
+### 3.6 CallTracker — Lifecycle
 
-## 4. Data Structures
+```python
+end_call(call: CallState) -> None
+```
+
+Centralizes call termination logic. Called by both the timeout poller and any explicit end signal. Responsible for post-roll append, removal from `active_calls`, emitting `CALL_ENDED`, and handing off to `PacketAssembler`.
 
 ### 4.1 CallState
 
@@ -261,7 +267,7 @@ PacketAssembler → EventBus  (PACKET_SAVED)
 
 1. JSONListener receives UDP packet, parses it into an `Op25Signal`, calls `CallTracker.handle_signal(signal)` directly
 2. CallTracker calls `resolve_call(signal)` — returns `None` (no active call)
-3. Create `CallState`
+3. Create `CallState`; initialize `last_activity_time = now`
 4. Append to `active_calls[tgid]`
 5. Pull pre-roll:
 ```python
@@ -293,8 +299,8 @@ if now - call.last_activity_time > CALL_END_TIMEOUT:
 
 Actions:
 1. Append post-roll audio
-2. Emit `CALL_ENDED`
-3. Remove `CallState` from `active_calls[tgid]`
+2. Remove `CallState` from `active_calls[tgid]`
+3. Emit `CALL_ENDED`
 4. Pass `CallState` to `PacketAssembler`
 
 ---
