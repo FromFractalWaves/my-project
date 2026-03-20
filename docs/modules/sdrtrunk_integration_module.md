@@ -14,12 +14,12 @@ SDRTrunk handles call segmentation internally. By the time this module sees a fi
 
 ## 2. How SDRTrunk Produces Output
 
-SDRTrunk writes one completed audio recording per call segment, typically as MP3 by default or WAV if configured, with rich embedded metadata and a structured filename that can be used as a fallback when tags are incomplete.
+For calls whose aliases are configured to record, and which are not suppressed as duplicates, SDRTrunk writes a completed recording per call segment — typically MP3 by default, or WAV if configured. Not every call produces a recording. Alias configuration and duplicate-call suppression both gate whether a file is written.
 
-Each file contains:
+Each recording contains:
 
-- **ID3 tags** — embedded metadata carrying talkgroup ID, source radio ID, frequency, system/site name, encryption status, and recording time metadata (`timestamp_start` required, `timestamp_end` when available)
-- **Filename** — structured encoding of key metadata fields as a best-effort fallback only
+- **ID3 tags** — embedded metadata expected to carry talkgroup ID, source radio ID, frequency, system/site name, encryption status, and recording time. The exact tag set is not officially guaranteed for every recording; the extractor must tolerate missing fields and fail cleanly only when required fields are absent.
+- **Filename** — structured encoding of key metadata as a best-effort fallback only
 
 **Filename patterns (observed examples — not a stable schema):**
 ```
@@ -27,16 +27,16 @@ Each file contains:
 20231001_173024_SystemName-SiteName__TO_41003_FROM_1612266.mp3
 ```
 
-Filenames include a timestamp prefix, system/site/channel identifiers, participant fields (TO/FROM), optional aliases, and sanitized special characters. The exact pattern varies across SDRTrunk versions and configurations. Filename parsing is best-effort only — it fills in fields the tags do not cover. If filename parsing fails for a required field, ingestion fails for that file; it does not silently produce incomplete packets.
+Filenames include a timestamp prefix, system/site/channel identifiers, participant fields (TO/FROM), optional aliases, and sanitized special characters. The exact pattern varies across SDRTrunk versions and configurations. Alias names are not guaranteed in filenames; identifier mapping may still be required. Filename parsing is best-effort only — it fills in fields the tags do not cover. If filename parsing fails for a required field, ingestion fails for that recording; it does not silently produce incomplete packets.
 
 **ID3 tags are authoritative.** Always read tags first. Fall back to filename only for fields absent from tags.
 
 **Recording format:**
 - V1 targets MP3 recordings. WAV support is out of scope for the first implementation.
-- MP3 is the SDRTrunk default. If a WAV file is encountered, log it and skip — do not attempt ingestion.
+- MP3 is the SDRTrunk default. If a WAV recording is encountered, log it and mark `skipped` — do not attempt ingestion.
 - A `recording_format` field is carried on the packet for downstream consumers (ASR, preprocessing) that need to know the audio format.
 
-**Encrypted calls:** SDRTrunk may still write a recording for encrypted calls. If encountered, the packet is ingested with `encrypted=True` and flagged for downstream handling. The `audio_path` is preserved.
+**Encrypted calls:** Do not assume ordinary audio recordings exist for encrypted calls. If a recording exists and its metadata marks it encrypted, ingest and flag it with `encrypted=True`; otherwise encrypted-call visibility may require event logs or MBE recordings rather than audio files.
 
 ---
 
