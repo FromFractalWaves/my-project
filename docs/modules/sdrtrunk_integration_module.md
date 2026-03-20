@@ -56,12 +56,13 @@ Output:
 
 Detection strategy:
 - Poll directory at a fixed interval (default: 500ms)
-- Only process files not modified within the last `FILE_STABLE_SECONDS` (default: 2s) to avoid reading files mid-write
-- Track file state explicitly:
+- Only process recordings not modified within the last `FILE_STABLE_SECONDS` (default: 2s) to avoid reading recordings mid-write
+- Track recording state explicitly:
   - `pending` — detected, not yet ingested
   - `ingested` — successfully processed
   - `failed` — ingestion failed; eligible for retry up to `MAX_RETRIES`
-- A file is only marked `ingested` after successful packet assembly and storage. Transient failures leave the file in `failed` state and do not permanently skip it.
+  - `skipped` — unsupported format in this version; no retry
+- A recording is only marked `ingested` after successful packet assembly and storage. Transient failures leave the recording in `failed` state and do not permanently skip it.
 
 Failure handling:
 - Directory not found or unreadable: logged, watcher retries on next poll
@@ -83,7 +84,7 @@ Output:
 - On success: calls `PacketAssembler.finalize_from_file(signal)` and emits `PACKET_SAVED`
 
 Failure handling:
-- Unsupported format (e.g. WAV in V1): logged, recording marked `failed` in watcher state
+- Unsupported format (e.g. WAV in V1): logged, recording marked `skipped` — no retry
 - Metadata extraction failure: logged, failure metadata written to dead-letter directory as JSON, recording left in place, marked `failed`
 - Does not propagate exceptions to `DirectoryWatcher`
 
@@ -193,6 +194,8 @@ subscribers = {
 }
 ```
 
+`PACKET_SAVED` semantics: emitted immediately after `Storage.insert_packet()` succeeds. It means the packet is durably stored — not that the full ingest lifecycle has committed. `DirectoryWatcher` state update happens after this event.
+
 Interface:
 
 ```python
@@ -220,7 +223,7 @@ SdrTrunkSignal {
   timestamp_start:  float          # Unix timestamp from ID3 tags or filename
   timestamp_end:    float | None   # from ID3 tags if available; otherwise null
   talkgroup_id:     int
-  source_ids:       list[int]      # may be empty if absent from metadata
+  source_ids:       list[int]      # zero, one, or multiple — depends on call metadata and SDRTrunk normalization
   system_name:      str | None
   site_name:        str | None
   frequency:        float | None
@@ -236,11 +239,13 @@ SdrTrunkSignal {
 ```
 FileState {
   path:          Path
-  status:        "pending" | "ingested" | "failed"
+  status:        "pending" | "ingested" | "failed" | "skipped"
   attempt_count: int
   last_attempt:  float | None
 }
 ```
+
+`skipped` is terminal — no retry. Used for unsupported formats in the current version.
 
 ---
 
@@ -255,33 +260,34 @@ SDRTrunk writes recording
   → MetadataExtractor.extract(path) → SdrTrunkSignal
   → PacketAssembler.finalize_from_file(signal) → TransmissionPacket
   → Storage.insert_packet(packet)
-  → FileIngester returns success to DirectoryWatcher
+  → FileIngester emits PACKET_SAVED via EventBus  # packet is durably stored
+  → FileIngester returns IngestResult to DirectoryWatcher
   → DirectoryWatcher marks recording ingested
-  → FileIngester emits PACKET_SAVED via EventBus
 ```
 
 ### 5.2 File Detection Sequence
 
 1. `DirectoryWatcher` polls recordings directory at `POLL_INTERVAL_MS`
-2. For each MP3 recording not in `ingested` state:
+2. For each recording not in `ingested` or `skipped` state:
    - Skip if modified within `FILE_STABLE_SECONDS`
    - Skip if in `failed` state and `attempt_count >= MAX_RETRIES`
    - Mark as `pending`, call `FileIngester.ingest(path)`
    - On success: mark `ingested`
+   - On unsupported format: mark `skipped`
    - On failure: mark `failed`, increment `attempt_count`
 
 ### 5.3 Ingestion Sequence
 
-1. `FileIngester` checks format — skip non-MP3 recordings in V1
+1. `FileIngester` checks format — unsupported formats (WAV in V1) marked `skipped`, return immediately
 2. Calls `MetadataExtractor.extract(path)`
 3. Extractor reads ID3 tags; falls back to filename parsing for missing fields
 4. Returns normalized `SdrTrunkSignal`
 5. `FileIngester` calls `PacketAssembler.finalize_from_file(signal)`
 6. Assembler builds `TransmissionPacket` with `audio_path` pointing to existing recording
 7. Assembler calls `Storage.insert_packet(packet)`
-8. `FileIngester` returns success to `DirectoryWatcher`
-9. `DirectoryWatcher` marks recording `ingested`
-10. `FileIngester` emits `PACKET_SAVED` via `EventBus`
+8. `FileIngester` emits `PACKET_SAVED` via `EventBus` — packet is durably stored
+9. `FileIngester` returns `IngestResult` to `DirectoryWatcher`
+10. `DirectoryWatcher` marks recording `ingested`
 
 ---
 
@@ -290,8 +296,10 @@ SDRTrunk writes recording
 ### 6.1 DirectoryWatcher → FileIngester
 
 ```python
-ingest(path: Path) -> None
+ingest(path: Path) -> IngestResult
 ```
+
+`IngestResult` carries: success/failure status, error type if failed, and `packet_id` if the packet was saved. In V1 a plain `bool` is acceptable; `IngestResult` is the intended V2 shape.
 
 ### 6.2 FileIngester → MetadataExtractor
 
@@ -327,8 +335,8 @@ DEAD_LETTER_DIR       = "./failed_ingestions"
 
 ## 8. Constraints
 
-- SDRTrunk owns the audio files — this module does not move, rename, or delete them
-- V1 supports MP3 only — WAV files are logged and skipped
+- SDRTrunk owns the recordings — this module does not move, rename, or delete them
+- V1 supports MP3 only — WAV recordings are logged and marked `skipped`
 - `timestamp_end` is stored if available in tags; null otherwise — not derived in this module
 - Encrypted calls are ingested and flagged — handling is a downstream concern
 - No pre-roll, post-roll, or call boundary logic — SDRTrunk handles all segmentation
