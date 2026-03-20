@@ -8,7 +8,7 @@ Convert SDRTrunk recording output into discrete `TransmissionPacket` objects rea
 
 The lifecycle in one sentence: SDRTrunk writes a completed call as an MP3 file with embedded metadata → the watcher detects it → metadata is extracted and normalized → a `TransmissionPacket` is assembled and persisted.
 
-**Key difference from the OP25 module:** SDRTrunk handles call segmentation internally. There is no live signal stream, no `CallTracker`, no `AudioBuffer`, and no timeout loop. By the time this module sees a file, the call is already complete. The ingestion model is file-based, not stream-based.
+SDRTrunk handles call segmentation internally. By the time this module sees a file, the call is already complete. The ingestion model is file-based — there is no live signal stream, no call tracking loop, and no timeout mechanism.
 
 ---
 
@@ -16,8 +16,8 @@ The lifecycle in one sentence: SDRTrunk writes a completed call as an MP3 file w
 
 SDRTrunk writes one MP3 file per completed call. Each file contains:
 
-- **Filename metadata** — structured filename encoding timestamp, system/site name, talkgroup ID, and source radio ID
-- **ID3 tags** — embedded MP3 tags carrying the same metadata more reliably
+- **ID3 tags** — embedded metadata carrying talkgroup ID, source radio ID, frequency, system/site name, and encryption status
+- **Filename** — structured encoding of the same metadata as a fallback
 
 **Filename format:**
 ```
@@ -32,11 +32,11 @@ Fields:
 | Talkgroup ID | `TO_41003` | Integer |
 | Source radio ID | `FROM_1612266` | Integer, absent on some calls |
 
-**ID3 tags are authoritative.** The filename is a fallback for fields the tags do not cover (e.g. system/site name). Parsers should read tags first and fall back to filename parsing for missing fields.
+**ID3 tags are authoritative.** The filename is a fallback for any fields the tags do not cover. Parsers read tags first and fall back to filename parsing for missing fields.
 
-**Encrypted calls:** SDRTrunk does not produce audio files for encrypted calls by default. If an encrypted call file is encountered (flagged via ID3 tag or filename convention), it should be ingested as a packet with `encrypted=True` and `audio_path` set to the file path, but flagged for downstream handling.
+**Audio format:** MP3, 8 kHz sample rate, mono.
 
-**Audio format:** MP3, 8 kHz sample rate, mono, 16-bit source samples.
+**Encrypted calls:** SDRTrunk may still write a file for encrypted calls. If encountered, the packet is ingested with `encrypted=True` and flagged for downstream handling. Audio path is preserved.
 
 ---
 
@@ -46,7 +46,7 @@ Fields:
 
 Responsibility:
 - Monitor the SDRTrunk recordings directory for new MP3 files
-- Detect completed call files and hand them to the `FileIngester`
+- Hand completed call files to the `FileIngester`
 
 Input:
 - Filesystem path to SDRTrunk recordings directory
@@ -55,9 +55,9 @@ Output:
 - New file paths passed to `FileIngester.ingest(path)`
 
 Detection strategy:
-- Poll the directory at a fixed interval (default: 500ms)
-- Track already-seen files to avoid double-ingestion
-- Only process files that have not been modified in the last N seconds (default: 2s) to avoid reading files mid-write
+- Poll directory at a fixed interval (default: 500ms)
+- Track already-seen files to prevent double-ingestion
+- Only process files not modified within the last `FILE_STABLE_SECONDS` (default: 2s) to avoid reading files mid-write
 
 Failure handling:
 - Directory not found or unreadable: logged, watcher retries on next poll
@@ -68,18 +68,18 @@ Failure handling:
 ### 3.2 FileIngester
 
 Responsibility:
-- Coordinate the ingestion of a single completed call file
+- Coordinate ingestion of a single completed call file
 - Orchestrate metadata extraction and packet assembly
 
 Input:
 - File path to a completed SDRTrunk MP3 recording
 
 Output:
-- Calls `PacketAssembler.finalize_from_file(path, metadata)` with normalized metadata
+- Calls `PacketAssembler.finalize_from_file(signal)` with normalized metadata
 
 Failure handling:
-- Metadata extraction failure: logged, file is moved to a dead-letter directory and skipped
-- Does not propagate exceptions to the `DirectoryWatcher`
+- Metadata extraction failure: logged, file moved to dead-letter directory, skipped
+- Does not propagate exceptions to `DirectoryWatcher`
 
 ---
 
@@ -87,7 +87,7 @@ Failure handling:
 
 Responsibility:
 - Extract call metadata from a SDRTrunk MP3 file
-- Produce a normalized `SdrTrunkSignal` object
+- Produce a normalized `SdrTrunkSignal`
 
 Input:
 - File path to MP3
@@ -99,9 +99,9 @@ Output:
   "timestamp_start": float,
   "talkgroup_id": int,
   "source_ids": [int],
-  "system_name": "string",
-  "site_name": "string",
-  "frequency": float | null,
+  "system_name": "string | null",
+  "site_name": "string | null",
+  "frequency": "float | null",
   "encrypted": bool,
   "audio_path": "string",
   "raw": {}
@@ -109,9 +109,9 @@ Output:
 ```
 
 Extraction strategy:
-1. Attempt to read ID3 tags from the MP3 file
+1. Read ID3 tags from the MP3 file
 2. Fall back to filename parsing for any fields not present in tags
-3. If both fail for a required field (`talkgroup_id`, `timestamp_start`), raise an extraction error
+3. If both fail for a required field, raise an extraction error
 
 Required fields: `talkgroup_id`, `timestamp_start`, `audio_path`
 
@@ -129,33 +129,34 @@ Responsibility:
 - Convert a normalized `SdrTrunkSignal` into a persisted `TransmissionPacket`
 - Insert record into database
 
-This component is **shared with the OP25 integration module**. The `finalize_from_file` path is an additional entry point that accepts pre-extracted metadata and an existing audio file path rather than raw audio bytes.
+SDRTrunk owns the audio file. This module does not write, move, rename, or delete it. The `audio_path` in the packet points to the existing file.
 
 Input:
-- `SdrTrunkSignal` (normalized metadata)
-- Audio file path (already written by SDRTrunk — no audio write step needed)
+- `SdrTrunkSignal` (normalized metadata + audio file path)
 
 Output:
-- `TransmissionPacket` conforming to base `Packet` schema
+
+`TransmissionPacket` extends the base `Packet` class. All packets stored to the database conform to that base schema. `TransmissionPacket` adds radio-specific fields on top of it.
 
 ```
 TransmissionPacket(Packet) {
   # --- base Packet fields ---
-  packet_id,          # maps to transmission_id (generated UUID)
+  packet_id,          # generated UUID
   packet_type,        # "transmission"
   timestamp,          # maps to timestamp_start
   source,             # maps to talkgroup_id + source_ids
   metadata,
+  payload,
 
   # --- TransmissionPacket-specific fields ---
-  transmission_id,
+  transmission_id,    # same as packet_id
   timestamp_start,
-  timestamp_end,      # null — SDRTrunk filenames encode start time only
+  timestamp_end,      # null — not available from SDRTrunk output
   talkgroup_id,
   source_ids,
   frequency,
   encrypted,
-  audio_path          # path to the existing SDRTrunk MP3 file
+  audio_path          # path to existing SDRTrunk MP3 file
 }
 ```
 
@@ -166,48 +167,48 @@ Failure handling:
 
 ### 3.5 EventBus
 
-Identical to the OP25 module. Synchronous in-process pub/sub. Emits `PACKET_SAVED` on successful ingestion.
+Responsibility:
+- Dispatch internal events to registered listeners in-process
+
+Model:
+- Synchronous, in-process pub/sub
+- No threading or async behavior in V1
+
+Structure:
+
+```python
+subscribers = {
+  "PACKET_SAVED": [fn]
+}
+```
+
+Interface:
+
+```python
+subscribe(event_type: str, handler: Callable) -> None
+emit(event_type: str, data: dict) -> None
+```
+
+Execution semantics:
+- `emit()` calls all handlers sequentially in the caller's thread
+- Handlers must be non-blocking
+
+Constraints:
+- EventBus is not a queue and not durable
+- It must not be used as a source of truth
 
 ---
 
-## 4. Interfaces
+## 4. Data Structures
 
-### 4.1 DirectoryWatcher → FileIngester
-
-```python
-ingest(path: Path) -> None
-```
-
-### 4.2 FileIngester → MetadataExtractor
-
-```python
-extract(path: Path) -> SdrTrunkSignal
-```
-
-### 4.3 FileIngester → PacketAssembler
-
-```python
-finalize_from_file(signal: SdrTrunkSignal) -> TransmissionPacket
-```
-
-### 4.4 PacketAssembler → Storage
-
-```python
-insert_packet(packet: TransmissionPacket) -> None
-```
-
----
-
-## 5. Data Structures
-
-### 5.1 SdrTrunkSignal
+### 4.1 SdrTrunkSignal
 
 ```
 SdrTrunkSignal {
   type:             "SDRTRUNK_CALL"
-  timestamp_start:  float          # Unix timestamp parsed from filename or ID3
+  timestamp_start:  float          # Unix timestamp parsed from ID3 or filename
   talkgroup_id:     int
-  source_ids:       list[int]      # may be empty if not present in metadata
+  source_ids:       list[int]      # may be empty if absent from metadata
   system_name:      str | None
   site_name:        str | None
   frequency:        float | None
@@ -219,20 +220,21 @@ SdrTrunkSignal {
 
 ---
 
-## 6. Lifecycle Sequence
+## 5. Lifecycle Sequence
 
-### 6.1 Signal Flow
+### 5.1 Signal Flow
 
 ```
-SDRTrunk writes MP3 → DirectoryWatcher detects file
-                    → FileIngester.ingest(path)
-                    → MetadataExtractor.extract(path) → SdrTrunkSignal
-                    → PacketAssembler.finalize_from_file(signal)
-                    → Storage.insert_packet(packet)
-                    → EventBus.emit(PACKET_SAVED)
+SDRTrunk writes MP3
+  → DirectoryWatcher detects file
+  → FileIngester.ingest(path)
+  → MetadataExtractor.extract(path) → SdrTrunkSignal
+  → PacketAssembler.finalize_from_file(signal) → TransmissionPacket
+  → Storage.insert_packet(packet)
+  → EventBus.emit(PACKET_SAVED)
 ```
 
-### 6.2 File Detection Sequence
+### 5.2 File Detection Sequence
 
 1. `DirectoryWatcher` polls recordings directory at `POLL_INTERVAL_MS`
 2. For each MP3 file not in the seen set:
@@ -240,7 +242,7 @@ SDRTrunk writes MP3 → DirectoryWatcher detects file
    - Add to seen set
    - Call `FileIngester.ingest(path)`
 
-### 6.3 Ingestion Sequence
+### 5.3 Ingestion Sequence
 
 1. `FileIngester` calls `MetadataExtractor.extract(path)`
 2. Extractor reads ID3 tags; falls back to filename parsing for missing fields
@@ -248,7 +250,35 @@ SDRTrunk writes MP3 → DirectoryWatcher detects file
 4. `FileIngester` calls `PacketAssembler.finalize_from_file(signal)`
 5. Assembler builds `TransmissionPacket` with `audio_path` pointing to existing MP3
 6. Assembler calls `Storage.insert_packet(packet)`
-7. EventBus emits `PACKET_SAVED`
+7. `EventBus` emits `PACKET_SAVED`
+
+---
+
+## 6. Interfaces
+
+### 6.1 DirectoryWatcher → FileIngester
+
+```python
+ingest(path: Path) -> None
+```
+
+### 6.2 FileIngester → MetadataExtractor
+
+```python
+extract(path: Path) -> SdrTrunkSignal
+```
+
+### 6.3 FileIngester → PacketAssembler
+
+```python
+finalize_from_file(signal: SdrTrunkSignal) -> TransmissionPacket
+```
+
+### 6.4 PacketAssembler → Storage
+
+```python
+insert_packet(packet: TransmissionPacket) -> None
+```
 
 ---
 
@@ -266,9 +296,9 @@ DEAD_LETTER_DIR       = "./failed_ingestions"
 ## 8. Constraints
 
 - SDRTrunk owns the audio files — this module does not move, rename, or delete them
-- `timestamp_end` is not available from SDRTrunk filename or standard ID3 tags — set to null
-- Encrypted call handling deferred to downstream — ingested as packet, flagged
-- No pre-roll or post-roll — call boundaries are determined by SDRTrunk
+- `timestamp_end` is not available from SDRTrunk output — set to null
+- Encrypted calls are ingested and flagged — handling is a downstream concern
+- No pre-roll, post-roll, or call boundary logic — SDRTrunk handles all segmentation
 
 ---
 
@@ -276,28 +306,12 @@ DEAD_LETTER_DIR       = "./failed_ingestions"
 
 - ASR processing
 - Thread/event routing (TRM)
-- Audio format conversion (MP3 → WAV for ASR is a preprocessing concern)
+- Audio format conversion (MP3 → WAV is a preprocessing concern)
 - Real-time streaming or live signal handling
 - Managing or cleaning up SDRTrunk's recordings directory
 
 ---
 
-## 10. Comparison to OP25 Module
+## 10. Result
 
-| Concern | OP25 Module | SDRTrunk Module |
-|---|---|---|
-| Call segmentation | `CallTracker` + timeout loop | SDRTrunk (external) |
-| Audio buffering | `AudioBuffer` (rolling PCM) | Not needed |
-| Signal ingestion | UDP JSON stream → `JSONListener` | Completed file → `DirectoryWatcher` |
-| Metadata source | Live UDP JSON events | ID3 tags + filename |
-| Audio format | WAV (written by module) | MP3 (written by SDRTrunk) |
-| `timestamp_end` | Available | Not available |
-| Packet assembly | `PacketAssembler.finalize_call()` | `PacketAssembler.finalize_from_file()` |
-
-The `PacketAssembler`, `StorageBackend`, `TransmissionPacket`, and `EventBus` are shared between both modules. Only the ingestion side differs.
-
----
-
-## 11. Result
-
-A file-based ingestion module that watches a SDRTrunk recordings directory, extracts call metadata from MP3 files, and produces `TransmissionPacket` objects conforming to the base `Packet` schema — ready for downstream ASR processing and TRM routing.
+A file-based ingestion module that watches a SDRTrunk recordings directory, extracts call metadata from completed MP3 files, and produces `TransmissionPacket` objects conforming to the base `Packet` schema — ready for downstream ASR processing and TRM routing.
