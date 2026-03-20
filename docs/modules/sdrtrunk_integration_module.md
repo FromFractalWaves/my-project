@@ -6,7 +6,7 @@
 
 Convert SDRTrunk recording output into discrete `TransmissionPacket` objects ready for downstream ASR processing and TRM routing.
 
-The lifecycle in one sentence: SDRTrunk writes a completed call as an audio file with embedded metadata → the watcher detects it → metadata is extracted and normalized → a `TransmissionPacket` is assembled and persisted.
+The lifecycle in one sentence: SDRTrunk writes a completed call as a recording with embedded metadata → the watcher detects it → metadata is extracted and normalized → a `TransmissionPacket` is assembled and persisted.
 
 SDRTrunk handles call segmentation internally. By the time this module sees a file, the call is already complete. The ingestion model is file-based — there is no live signal stream, no call tracking loop, and no timeout mechanism.
 
@@ -18,7 +18,7 @@ SDRTrunk writes one completed audio recording per call segment, typically as MP3
 
 Each file contains:
 
-- **ID3 tags** — embedded metadata carrying talkgroup ID, source radio ID, frequency, system/site name, encryption status, and recording timestamps
+- **ID3 tags** — embedded metadata carrying talkgroup ID, source radio ID, frequency, system/site name, encryption status, and recording time metadata (`timestamp_start` required, `timestamp_end` when available)
 - **Filename** — structured encoding of key metadata fields as a best-effort fallback only
 
 **Filename patterns (observed examples — not a stable schema):**
@@ -36,7 +36,7 @@ Filenames include a timestamp prefix, system/site/channel identifiers, participa
 - MP3 is the SDRTrunk default. If a WAV file is encountered, log it and skip — do not attempt ingestion.
 - A `recording_format` field is carried on the packet for downstream consumers (ASR, preprocessing) that need to know the audio format.
 
-**Encrypted calls:** SDRTrunk may still write a file for encrypted calls. If encountered, the packet is ingested with `encrypted=True` and flagged for downstream handling. Audio path is preserved.
+**Encrypted calls:** SDRTrunk may still write a recording for encrypted calls. If encountered, the packet is ingested with `encrypted=True` and flagged for downstream handling. The `audio_path` is preserved.
 
 ---
 
@@ -45,14 +45,14 @@ Filenames include a timestamp prefix, system/site/channel identifiers, participa
 ### 3.1 DirectoryWatcher
 
 Responsibility:
-- Monitor the SDRTrunk recordings directory for new audio files
-- Hand completed call files to the `FileIngester`
+- Monitor the SDRTrunk recordings directory for new recordings
+- Hand completed recordings to the `FileIngester`
 
 Input:
 - Filesystem path to SDRTrunk recordings directory
 
 Output:
-- New file paths passed to `FileIngester.ingest(path)`
+- New recording paths passed to `FileIngester.ingest(path)`
 
 Detection strategy:
 - Poll directory at a fixed interval (default: 500ms)
@@ -72,18 +72,19 @@ Failure handling:
 ### 3.2 FileIngester
 
 Responsibility:
-- Coordinate ingestion of a single completed call file
+- Coordinate ingestion of a single completed recording
 - Orchestrate metadata extraction and packet assembly
 
 Input:
 - File path to a completed SDRTrunk recording
 
 Output:
-- Calls `PacketAssembler.finalize_from_file(signal)` with normalized metadata
+- Returns success or failure to `DirectoryWatcher`
+- On success: calls `PacketAssembler.finalize_from_file(signal)` and emits `PACKET_SAVED`
 
 Failure handling:
-- Unsupported format (e.g. WAV in V1): logged, file marked `failed` in watcher state
-- Metadata extraction failure: logged, file moved to dead-letter directory, marked `failed`
+- Unsupported format (e.g. WAV in V1): logged, recording marked `failed` in watcher state
+- Metadata extraction failure: logged, failure metadata written to dead-letter directory as JSON, recording left in place, marked `failed`
 - Does not propagate exceptions to `DirectoryWatcher`
 
 ---
@@ -95,7 +96,7 @@ Responsibility:
 - Produce a normalized `SdrTrunkSignal`
 
 Input:
-- File path to MP3
+- File path to a SDRTrunk recording
 
 Output:
 ```json
@@ -249,19 +250,20 @@ FileState {
 
 ```
 SDRTrunk writes recording
-  → DirectoryWatcher detects file
-  → FileIngester.ingest(path)
+  → DirectoryWatcher detects recording
+  → DirectoryWatcher marks recording pending, calls FileIngester.ingest(path)
   → MetadataExtractor.extract(path) → SdrTrunkSignal
   → PacketAssembler.finalize_from_file(signal) → TransmissionPacket
   → Storage.insert_packet(packet)
-  → DirectoryWatcher marks file ingested
-  → EventBus.emit(PACKET_SAVED)
+  → FileIngester returns success to DirectoryWatcher
+  → DirectoryWatcher marks recording ingested
+  → FileIngester emits PACKET_SAVED via EventBus
 ```
 
 ### 5.2 File Detection Sequence
 
 1. `DirectoryWatcher` polls recordings directory at `POLL_INTERVAL_MS`
-2. For each MP3 file not in `ingested` state:
+2. For each MP3 recording not in `ingested` state:
    - Skip if modified within `FILE_STABLE_SECONDS`
    - Skip if in `failed` state and `attempt_count >= MAX_RETRIES`
    - Mark as `pending`, call `FileIngester.ingest(path)`
@@ -270,15 +272,16 @@ SDRTrunk writes recording
 
 ### 5.3 Ingestion Sequence
 
-1. `FileIngester` checks format — skip non-MP3 in V1
+1. `FileIngester` checks format — skip non-MP3 recordings in V1
 2. Calls `MetadataExtractor.extract(path)`
 3. Extractor reads ID3 tags; falls back to filename parsing for missing fields
 4. Returns normalized `SdrTrunkSignal`
 5. `FileIngester` calls `PacketAssembler.finalize_from_file(signal)`
-6. Assembler builds `TransmissionPacket` with `audio_path` pointing to existing file
+6. Assembler builds `TransmissionPacket` with `audio_path` pointing to existing recording
 7. Assembler calls `Storage.insert_packet(packet)`
-8. `DirectoryWatcher` marks file `ingested`
-9. `EventBus` emits `PACKET_SAVED`
+8. `FileIngester` returns success to `DirectoryWatcher`
+9. `DirectoryWatcher` marks recording `ingested`
+10. `FileIngester` emits `PACKET_SAVED` via `EventBus`
 
 ---
 
