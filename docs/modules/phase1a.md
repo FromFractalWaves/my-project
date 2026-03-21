@@ -37,14 +37,15 @@ Additional SDR hardware (HackRF, additional RTL-SDR dongles) is available but in
 Phase 1A is a two-piece system:
 
 ```
-RTL-SDR → [GNU Radio + gr-op25] → ZMQ → [Python Backend] → TransmissionPackets
+RTL-SDR → [GNU Radio + gr-op25 blocks] →  ZMQ stream (PCM)    → [Python Backend] → TransmissionPackets
+                                        →  ZMQ messages (ctrl) ↗
 ```
 
-**GNU Radio** handles all RF and signal processing. It is responsible for tuning, decoding the P25 control channel, decoding voice channels within the visible band, and streaming audio + metadata to the Python backend. No business logic lives in the flowgraph.
+**GNU Radio** handles all RF and signal processing. It is responsible for tuning, decoding the P25 control channel, decoding voice channels within the visible band, and streaming audio + metadata to the Python backend. No business logic lives in the flowgraph. The flowgraph uses the `gr-op25` and `gr-op25_repeater` blocks from the OP25 codebase directly — not the stock `rx.py` / `multi_rx.py` application layer that sits on top of them.
 
 **Python backend** handles everything above the signal layer. It receives the stream from GNU Radio, manages per-talkgroup audio buffers, detects transmission boundaries, writes WAV files, and emits TransmissionPackets.
 
-The boundary between the two is a ZMQ socket. GNU Radio has native ZMQ sink support. This gives a clean async boundary — the flowgraph never blocks on downstream processing.
+The boundary between the two is two ZMQ sockets — one per transport lane. GNU Radio has native ZMQ sink support. This gives a clean async boundary — the flowgraph never blocks on downstream processing.
 
 ---
 
@@ -63,15 +64,16 @@ The boundary between the two is a ZMQ socket. GNU Radio has native ZMQ sink supp
 |---|---|
 | `osmosdr.source` | RTL-SDR input |
 | `low_pass_filter` | Band limiting |
-| `op25` control channel decoder | Tracks trunking control channel, emits channel grants |
-| `op25` voice channel decoder(s) | Decodes active voice channels within band |
-| `zeromq.pub_sink` | Streams audio + metadata to Python backend |
+| `gr-op25` control channel decoder | Tracks trunking control channel, emits channel grants |
+| `gr-op25_repeater` voice channel decoder(s) | Decodes active voice channels within band |
+| `zeromq.push_sink` or `zeromq.pub_sink` | PCM audio transport lane to Python backend (stream sink) |
+| `zeromq.pub_msg_sink` | Call/control metadata transport lane to Python backend (message sink) |
 
 ### Design Decisions
 
-**gr-op25, not OP25 or SDRTrunk.** OP25 and SDRTrunk were rejected because their data output format required significant translation work. gr-op25 is used as a library — the flowgraph emits exactly what the Python backend needs, with no intermediate format translation.
+**gr-op25 blocks directly, not the stock OP25 app layer.** The OP25 codebase (boatbod fork) is structured as `gr-op25`, `gr-op25_repeater`, and a higher-level `apps/` layer (`rx.py`, `multi_rx.py`). The stock app layer was rejected because its data output format required significant translation work to fit the Albatross packet contract. Instead the flowgraph uses the `gr-op25` and `gr-op25_repeater` blocks directly, so the output is exactly what the Python backend needs with no intermediate translation.
 
-**ZMQ over plain socket.** Native GNU Radio support, clean async boundary, pub/sub model maps naturally to multi-channel output.
+**Two ZMQ transport lanes.** GNU Radio's ZMQ blocks distinguish between stream data and message passing at the wire level — their behavior is not interchangeable. A single sink cannot cleanly carry both PCM samples and call-control metadata without defining a custom framing scheme. The safer design is two explicit lanes: a stream socket for PCM audio and a message socket for call/control metadata. Each lane has a well-defined type and the Python backend subscribes to both independently.
 
 **No file writing in GNU Radio.** Audio artifacts are owned by the Python backend. The flowgraph streams raw PCM and stays out of the persistence business.
 
@@ -83,7 +85,7 @@ The boundary between the two is a ZMQ socket. GNU Radio has native ZMQ sink supp
 
 ### Responsibilities
 
-- Subscribe to the ZMQ stream from GNU Radio
+- Subscribe to the ZMQ PCM stream lane and the ZMQ metadata/control message lane independently
 - Maintain a per-talkgroup audio buffer map
 - Use P25 call start / call end events to open and close buffers
 - On call end: flush buffer, write WAV file, emit TransmissionPacket
@@ -103,17 +105,18 @@ Each talkgroup gets its own independent buffer. Simultaneous transmissions on di
 
 ### Transmission Boundary Detection
 
-Call start and call end events come from gr-op25's control channel tracking. The Python backend uses these events as write triggers:
+The OP25 codebase exposes trunking and channel state via a metadata stream — fields including `frequency_data`, `channel_update`, and `srcaddr` are present in recent versions of the boatbod repo. However, this metadata is chatty and the presence and reliability of specific fields (particularly source radio ID) can vary depending on which update stream is used and how the system is configured.
 
-- `call_start(TGID, source_radio_id, frequency)` → open buffer for TGID
-- `call_end(TGID)` → flush buffer → write WAV → emit TransmissionPacket
+The Python backend should not assume a clean `call_start(TGID, source_radio_id, frequency)` / `call_end(TGID)` signal pair exists out of the box. Transmission boundaries may need to be derived from a combination of channel update events and an inactivity policy (e.g. close a buffer if no PCM arrives for a TGID within N seconds).
+
+The exact boundary detection strategy is an implementation-discovery item. See Open Questions.
 
 ### WAV File Output
 
 Each completed transmission is written as a mono WAV file. Naming convention:
 
 ```
-{timestamp_start}_{tgid}_{source_radio_id}_{uuid}.wav
+{timestamp_start}_{tgid}_{source_radio_id_or_unknown}_{uuid}.wav
 ```
 
 Files are written to a configurable output directory. The path is stored in the TransmissionPacket.
@@ -136,25 +139,25 @@ Conforms to the Albatross base Packet schema with radio-specific fields:
   "timestamp_end": "ISO8601",
   "source": {
     "talkgroup_id": 12345,
-    "source_radio_id": "abc123",
+    "source_radio_id": "abc123 | null",
     "frequency": 856437500
   },
   "metadata": {
     "talkgroup_id": 12345,
-    "source_radio_id": "abc123",
+    "source_radio_id": "abc123 | null",
     "frequency": 856437500,
     "system": "p25_phase1"
   },
   "payload": {
     "audio_path": "/path/to/audio.wav",
     "duration_seconds": 4.2,
-    "sample_rate": 8000
+    "sample_rate": null
   },
   "status": "captured"
 }
 ```
 
-The `metadata` field is what the TRM will consume in Phase 1B. It is populated here, at packet construction time, so the TRM never needs to reach back into the signal layer.
+`source_radio_id` is nullable — presence depends on what the OP25 metadata stream exposes for a given transmission. `sample_rate` is populated at implementation time once the gr-op25 output rate is confirmed.
 
 ---
 
@@ -184,8 +187,10 @@ The `metadata` field is what the TRM will consume in Phase 1B. It is populated h
 
 ## Open Questions
 
-- What sample rate does gr-op25 output for decoded voice? (Likely 8kHz — confirm before WAV writer implementation)
-- What is the exact ZMQ message format from gr-op25? Define the wire format before building the Python subscriber
-- How does gr-op25 signal call boundaries — events, flags on the stream, or metadata frames? Confirm before building boundary detection
-- What happens when a call_start arrives for a TGID that already has an open buffer? (Overlap / re-grant edge case — needs a handling policy)
-- Where does the TransmissionPacket get handed off at the Phase 1A/1B boundary — a queue, a database write, a direct function call?
+- **gr-op25 PCM output sample rate.** Likely 8kHz but must be confirmed before WAV writer implementation. Set `sample_rate` in the packet schema once known.
+- **ZMQ wire format — PCM lane.** What is the exact frame/chunk structure on the stream socket? Define before building the Python PCM subscriber.
+- **ZMQ wire format — metadata lane.** What fields does the control message socket emit, at what cadence, and in what format? Specifically: are `channel_update`, `frequency_data`, and `srcaddr` present and reliable enough to derive call boundaries from?
+- **Transmission boundary detection strategy.** Can call open/close be derived cleanly from the metadata stream, or does the backend need to combine metadata events with a PCM inactivity timeout? What is the right inactivity window?
+- **source_radio_id availability.** Under what conditions is `srcaddr` present in the metadata stream? Does it vary by talkgroup type, system configuration, or update stream used? The packet schema treats it as nullable until confirmed.
+- **Overlap / re-grant edge case.** What happens when a channel update for a TGID arrives while that TGID already has an open buffer? Define a handling policy before building the buffer manager.
+- **Phase 1A/1B handoff.** Where does the TransmissionPacket get handed off at the boundary — a queue, a database write, or a direct function call?
