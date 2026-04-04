@@ -1,12 +1,16 @@
-# Phase 1A Capture Skeleton (flowgraph + bridge aligned)
+# Phase 1A Capture — P25 Trunked Radio
 
-This skeleton is built around the current multi-lane GNU Radio flowgraph and the ZMQ bridge.
+Captures P25 Phase 1 trunked radio transmissions and emits structured TransmissionPackets (WAV + metadata).
 
-Runtime shape:
+## Status
+
+The flowgraph has been validated against live RF. Control channel decoding, TSBK parsing, and voice lane assignment are working. The bridge and backend have not yet been tested against live data.
+
+## Runtime shape
 
 ```text
 RTL-SDR -> flowgraph.py
-       -> metadata ZMQ PUSH (json bytes)
+       -> raw TSBK bytes (msg_queue, decoded by tsbk.py)
        -> per-lane PCM ZMQ PUSH (raw int16)
 flowgraph -> zmq_bridge.py
          -> backend control ZMQ PUSH (json bytes)
@@ -17,10 +21,12 @@ zmq_bridge -> phase1a.run_backend
 
 ## Project layout
 
-- `flowgraph.py` — GNU Radio / gr-op25 multi-lane capture flowgraph scaffold
+- `flowgraph.py` — GNU Radio multi-lane capture flowgraph (validated against live RF)
 - `zmq_bridge.py` — correlates lane ownership and repackages PCM into multipart frames
+- `tsbk_dump.py` — standalone TSBK dumper for system discovery
 - `phase1a/settings.py` — shared constants and endpoint helpers
 - `phase1a/models.py` — metadata, call, and packet dataclasses
+- `phase1a/tsbk.py` — standalone TSBK parser extracted from OP25 (GPL v3)
 - `phase1a/buffer_manager.py` — per-talkgroup active call manager with explicit release + inactivity timeout
 - `phase1a/wav_writer.py` — writes mono int16 WAV files
 - `phase1a/packet_builder.py` — constructs `TransmissionPacket`
@@ -29,27 +35,29 @@ zmq_bridge -> phase1a.run_backend
 - `phase1a/run_backend.py` — CLI entrypoint for the backend
 - `tests/` — unit tests for buffer management, WAV writing, and packet building
 
-## Important notes
+## Bring-up order
 
-- This is a skeleton, not a finished receiver.
-- The GNU Radio files are syntax scaffolds; they are not executed in the test suite.
-- The exact OP25 metadata field inventory and cadence still need live validation.
-- The bridge now forwards **both** control metadata and lane-tagged PCM to the backend.
-- `lane_id` is injected into forwarded metadata by the flowgraph poller so the bridge can correlate grants with PCM lanes.
+```bash
+export PYTHONPATH=/usr/local/lib/python3.13/dist-packages:$PYTHONPATH
 
-## Suggested bring-up order
+# Terminal 1
+python flowgraph.py
 
-1. Run `flowgraph.py`
-2. Run `zmq_bridge.py`
-3. Run `python -m phase1a.run_backend`
-4. Inspect stdout and `out/packets.jsonl`
-5. Tune metadata field mapping against real `[meta]` traffic
+# Terminal 2
+python zmq_bridge.py
+
+# Terminal 3
+python -m phase1a.run_backend
+```
+
+Inspect stdout and `out/packets.jsonl`. WAV files land in `out/wav/`.
 
 ## External dependencies
 
 The backend/bridge side uses standard Python + `pyzmq`.
 
 The flowgraph additionally requires:
-- GNU Radio
-- osmosdr
-- OP25 / gr-op25 / gr-op25_repeater blocks available in the Python environment
+- GNU Radio 3.10+
+- gr-osmosdr
+- gr-op25 / gr-op25_repeater blocks (boatbod fork, compiled and installed)
+- OP25 `p25_demodulator.py` hierblock (referenced via sys.path from the OP25 clone)

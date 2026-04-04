@@ -24,9 +24,9 @@ Phase 1A ends at the packet boundary. Everything downstream — ASR, TRM, storag
 
 **Single RTL-SDR dongle.**
 
-The RTL-SDR is tuned to a continuous band centered near the system's control channel. This band covers the control channel plus a subset of the system's voice channels. Any voice channel granted outside this band is silently ignored — no special handling required, the signal simply isn't present.
+The RTL-SDR is tuned to 855.75 MHz (between the control channel at 854.6125 MHz and the voice channels at 856-857 MHz) at 3.2 Msps, giving a visible band of 854.15-857.35 MHz. The control channel is decoded at a -1.1375 MHz offset from center. Any voice channel granted outside this band is silently ignored.
 
-P25 voice channels are spaced 12.5kHz apart. A single RTL-SDR can realistically cover 1–2MHz of usable bandwidth, which is enough to capture many simultaneous voice channels from a local system.
+P25 voice channels are spaced 12.5kHz apart. At 3.2 Msps the theoretical maximum is 256 RF slots, though the practical decoder budget is much lower (currently capped at 8 voice lanes).
 
 Additional SDR hardware (HackRF, additional RTL-SDR dongles) is available but in storage and out of scope for this phase. The architecture is designed to accommodate multi-device expansion later without structural changes.
 
@@ -37,15 +37,17 @@ Additional SDR hardware (HackRF, additional RTL-SDR dongles) is available but in
 Phase 1A is a two-piece system:
 
 ```
-RTL-SDR → [GNU Radio + gr-op25 blocks] →  ZMQ stream (PCM)    → [Python Backend] → TransmissionPackets
-                                        →  ZMQ messages (ctrl) ↗
+RTL-SDR → [GNU Radio + gr-op25 blocks] →  raw TSBK bytes (msg_queue)  → [TSBK Parser + MetadataPoller] → ZMQ PUSH (JSON)
+                                        →  per-lane PCM (ZMQ PUSH)    → [ZMQ Bridge] → [Python Backend] → TransmissionPackets
 ```
 
-**GNU Radio** handles all RF and signal processing. It is responsible for tuning, decoding the P25 control channel, decoding voice channels within the visible band, and streaming audio + metadata to the Python backend. No business logic lives in the flowgraph. The flowgraph uses the `gr-op25` and `gr-op25_repeater` blocks from the OP25 codebase directly — not the stock `rx.py` / `multi_rx.py` application layer that sits on top of them.
+**GNU Radio** handles all RF and signal processing. It tunes the RTL-SDR, decodes the P25 control channel (at an offset from center), decodes voice channels within the visible band, and streams audio + raw trunking data. The flowgraph uses the `gr-op25` and `gr-op25_repeater` blocks from the OP25 codebase directly — not the stock `rx.py` / `multi_rx.py` application layer. The `p25_demod_fb` hierblock from OP25's app layer is used for the C4FM matched filter and symbol timing.
 
-**Python backend** handles everything above the signal layer. It receives the stream from GNU Radio, manages per-talkgroup audio buffers, detects transmission boundaries, writes WAV files, and emits TransmissionPackets.
+**TSBK parser** (`phase1a/tsbk.py`) decodes the raw binary TSBKs from the message queue into structured channel grant events (tgid, frequency, srcaddr). Extracted from OP25's `trunking.py` (GPL v3).
 
-The boundary between the two is two ZMQ sockets — one per transport lane. GNU Radio has native ZMQ sink support. This gives a clean async boundary — the flowgraph never blocks on downstream processing.
+**Python backend** handles everything above the signal layer. It receives parsed metadata and tagged PCM from the ZMQ bridge, manages per-talkgroup audio buffers, detects transmission boundaries, writes WAV files, and emits TransmissionPackets.
+
+The boundary between GNU Radio and the backend is ZMQ sockets. GNU Radio has native ZMQ sink support. This gives a clean async boundary — the flowgraph never blocks on downstream processing.
 
 ---
 
@@ -74,7 +76,7 @@ The boundary between the two is two ZMQ sockets — one per transport lane. GNU 
 
 **gr-op25 blocks directly, not the stock OP25 app layer.** The OP25 codebase (boatbod fork) is structured as `gr-op25`, `gr-op25_repeater`, and a higher-level `apps/` layer (`rx.py`, `multi_rx.py`). The stock app layer was rejected because its data output format required significant translation work to fit the Albatross packet contract. Instead the flowgraph uses the `gr-op25` and `gr-op25_repeater` blocks directly, so the output is exactly what the Python backend needs with no intermediate translation.
 
-**Two transport lanes, different mechanisms.** The PCM lane is a standard GNU Radio stream sink — `zeromq.push_sink` carries int16 samples directly. The metadata lane does not use a ZMQ message block at the GNU Radio level. Instead, `p25_frame_assembler` and `fsk4_demod_ff` both accept a `gr.msg_queue` and write trunking/status JSON into it. A `MetadataPoller` background thread drains that queue and forwards each message as JSON bytes over a plain ZMQ PUSH socket to the Python capture backend. This sidesteps PMT serialization entirely and gives the backend a clean JSON stream to parse.
+**Two transport lanes, different mechanisms.** The PCM lane is a standard GNU Radio stream sink — `zeromq.push_sink` carries int16 samples directly. The metadata lane uses a `gr.msg_queue` — `p25_frame_assembler` writes raw binary TSBK PDUs (12 bytes: 2-byte NAC + 10-byte body, message type 7) into the queue. A `MetadataPoller` background thread drains the queue, decodes TSBKs via `phase1a/tsbk.py`, and forwards parsed grant events as JSON bytes over a ZMQ PUSH socket. Note: the C++ blocks do NOT produce JSON — the TSBK parser handles all decoding in Python.
 
 **No file writing in GNU Radio.** Audio artifacts are owned by the Python backend. The flowgraph streams raw PCM and stays out of the persistence business.
 
@@ -188,10 +190,16 @@ Conforms to the Albatross base Packet schema with radio-specific fields:
 
 ## Open Questions
 
+### Resolved
+
+- **Metadata wire format.** The msg_queue produces raw binary TSBK PDUs (type=7, 12 bytes), NOT JSON. Decoded by `phase1a/tsbk.py`. Field inventory confirmed: opcodes 0x00 (grant with tgid/freq/srcaddr), 0x02 (grant update), 0x3d (iden_up for frequency table).
+- **source_radio_id availability.** `srcaddr` is present on `grp_v_ch_grant` (opcode 0x00). Not present on `grp_v_ch_grant_updt` (opcode 0x02). The grant-time srcaddr must be carried through via the LaneManager/bridge.
+- **PCM lane framing.** Each voice lane has its own ZMQ push sink on a dedicated port. PCM-to-TGID correlation is handled by the LaneManager which maps lanes to TGIDs based on channel grants.
+
+### Remaining
+
 - **gr-op25 PCM output sample rate.** Likely 8kHz but must be confirmed before WAV writer implementation. Set `sample_rate` in the packet schema once known.
-- **Metadata wire format — field inventory.** The metadata lane emits JSON from `p25_frame_assembler`'s `gr.msg_queue`. The `json_type`, `tgid`, `freq`, and `srcaddr` fields are expected based on the OP25 codebase, but exact field names, presence, and cadence need to be confirmed against live data. Run the flowgraph and inspect raw `[meta]` output before building the boundary detection logic in the capture backend.
-- **PCM lane framing.** The `zeromq.push_sink` carries raw int16 PCM samples. There is no per-TGID tagging in the stream — the PCM lane carries audio from whatever voice channel the flowgraph is currently decoding. Mapping PCM chunks to TGIDs requires correlating with the metadata lane. The exact approach is an implementation-discovery item.
 - **Transmission boundary detection strategy.** Can call open/close be derived cleanly from the metadata stream, or does the backend need to combine metadata events with a PCM inactivity timeout? What is the right inactivity window?
-- **source_radio_id availability.** Under what conditions is `srcaddr` present in the metadata stream? Does it vary by talkgroup type, system configuration, or update stream used? The packet schema treats it as nullable until confirmed.
 - **Overlap / re-grant edge case.** What happens when a channel update for a TGID arrives while that TGID already has an open buffer? Define a handling policy before building the buffer manager.
 - **Phase 1A/1B handoff.** Where does the TransmissionPacket get handed off at the boundary — a queue, a database write, or a direct function call?
+- **Lane release.** Lanes are currently assigned on grants but never released. Need either explicit release events from TSBKs or inactivity-based release in the LaneManager.
