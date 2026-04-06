@@ -43,6 +43,7 @@ from phase1a.settings import (
     CHANNEL_RATE,
     CONTROL_FREQ_HZ,
     CONTROL_OFFSET_HZ,
+    LANE_STALE_TIMEOUT_S,
     META_ENDPOINT,
     P25_CHANNEL_SPACING,
     RTL_GAIN,
@@ -108,17 +109,36 @@ class LaneManager:
     def __init__(self, lanes: list[VoiceLane]) -> None:
         self._lanes = lanes
         self._tgid_to_lane: dict[int, VoiceLane] = {}
+        self._tgid_last_seen: dict[int, float] = {}
         self._lock = threading.Lock()
 
     def on_grant(self, tgid: int, freq: int) -> Optional[int]:
         with self._lock:
+            now = time.time()
+            self._tgid_last_seen[tgid] = now
+
+            # If this tgid already has a lane, update it
             if tgid in self._tgid_to_lane:
                 lane = self._tgid_to_lane[tgid]
                 lane.assign(tgid, freq)
                 return lane.lane_id
+
+            # Frequency preemption: if another tgid holds a lane on this freq,
+            # release it — the system has reassigned the channel
+            for old_tgid, lane in list(self._tgid_to_lane.items()):
+                if lane.freq == freq and old_tgid != tgid:
+                    print(f"[lane] lane {lane.lane_id} preempted: tgid={old_tgid} "
+                          f"-> tgid={tgid} on {freq/1e6:.4f}MHz", flush=True)
+                    self._tgid_to_lane.pop(old_tgid)
+                    self._tgid_last_seen.pop(old_tgid, None)
+                    lane.assign(tgid, freq)
+                    self._tgid_to_lane[tgid] = lane
+                    return lane.lane_id
+
+            # Allocate a free lane
             free = next((l for l in self._lanes if not l.active), None)
             if free is None:
-                print(f"[lane] pool exhausted, dropping tgid={tgid} freq={freq}", flush=True)
+                print(f"[lane] pool exhausted, dropping tgid={tgid} freq={freq/1e6:.4f}MHz", flush=True)
                 return None
             free.assign(tgid, freq)
             self._tgid_to_lane[tgid] = free
@@ -127,13 +147,33 @@ class LaneManager:
 
     def on_release(self, tgid: int) -> Optional[int]:
         with self._lock:
-            lane = self._tgid_to_lane.pop(tgid, None)
-            if lane is None:
-                return None
-            lane_id = lane.lane_id
-            lane.release()
-            print(f"[lane] lane {lane_id} released from tgid={tgid}", flush=True)
-            return lane_id
+            return self._release_locked(tgid)
+
+    def _release_locked(self, tgid: int) -> Optional[int]:
+        """Release a lane. Caller must hold self._lock."""
+        lane = self._tgid_to_lane.pop(tgid, None)
+        self._tgid_last_seen.pop(tgid, None)
+        if lane is None:
+            return None
+        lane_id = lane.lane_id
+        lane.release()
+        print(f"[lane] lane {lane_id} released from tgid={tgid}", flush=True)
+        return lane_id
+
+    def sweep_stale(self, timeout: float) -> list[int]:
+        """Release lanes whose tgid hasn't been seen in the grant stream recently."""
+        released = []
+        with self._lock:
+            now = time.time()
+            stale = [
+                tgid for tgid, last in self._tgid_last_seen.items()
+                if now - last > timeout
+            ]
+            for tgid in stale:
+                lane_id = self._release_locked(tgid)
+                if lane_id is not None:
+                    released.append(tgid)
+        return released
 
     def snapshot(self) -> list[dict]:
         with self._lock:
@@ -160,9 +200,15 @@ class MetadataPoller(threading.Thread):
         print(f"[meta] poller -> {self.endpoint}", flush=True)
         msg_count = 0
         grant_count = 0
+        last_sweep = time.time()
         while not self._stop_event.is_set():
             msg = self.msgq.delete_head_nowait()
             if msg is None:
+                # No message — use idle time for stale lane sweep
+                now = time.time()
+                if now - last_sweep > 2.0:
+                    released = self.lane_manager.sweep_stale(LANE_STALE_TIMEOUT_S)
+                    last_sweep = now
                 time.sleep(0.005)
                 continue
             msg_count += 1

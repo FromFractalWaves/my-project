@@ -24,6 +24,7 @@ BACKEND_CTRL_ENDPOINT = "tcp://127.0.0.1:5581"
 
 POLL_TIMEOUT_MS = 10
 INACTIVITY_TIMEOUT_S = 1.5
+LANE_STALE_TIMEOUT_S = 5.0          # release lane if tgid not seen in grant stream for this long
 PCM_SAMPLE_WIDTH_BYTES = 2
 PCM_CHANNELS = 1
 
